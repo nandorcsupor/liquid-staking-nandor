@@ -2,8 +2,9 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program::{System};
 use anchor_spl::token::Token;
 use anchor_spl::token::{Mint, TokenAccount};
+use solana_program_option::COption;
 
-declare_id!("8khsTGWjRApsWpCasqNCHZ44ekDMvPXstvs6fkeJHvhQ");
+declare_id!("4fLrcA8T6sH1z691Rv4JubkzqoNq9fjooaw4iKfjXzj3");
 
 const STAKE_ACCOUNT_SIZE: usize = 200;
 
@@ -70,13 +71,6 @@ pub mod liquid_staking {
         sol_amount: u64,
     ) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
-        let authority = &ctx.accounts.authority;
-
-        require_keys_eq!(
-            pool.authority,
-            authority.key(),
-            ErrorCode::Unauthorized
-        );
         
         require!(sol_amount > 0, ErrorCode::InvalidAmount);
         require!(sol_amount >= 1_000_000, ErrorCode::MinimumDeposit); // 0.001 SOL minimum
@@ -103,20 +97,15 @@ pub mod liquid_staking {
         anchor_lang::system_program::transfer(cpi_context, sol_amount)?;
 
         // Mint FluidSOL tokens to user
-        let authority_key = pool.authority.key();
-        let seeds = &[
-            b"pool",
-            authority_key.as_ref(),
-            &[pool.bump],
-        ];
+        let seeds = &[b"pool".as_ref(), &[pool.bump]];
         let signer = &[&seeds[..]];
 
         let cpi_accounts = anchor_spl::token::MintTo {
         mint: ctx.accounts.fluidSOL_mint.to_account_info(),
         to: ctx.accounts.user_fluidSOL_account.to_account_info(),
-        authority: pool.to_account_info(), // Javítsd erre: a pool PDA az aláíró
+        authority: pool.to_account_info(),
     };
-    let cpi_ctx = CpiContext::new_with_signer( // Használj new_with_signer-t a PDA aláírásához
+    let cpi_ctx = CpiContext::new_with_signer(
         ctx.accounts.token_program.to_account_info(),
         cpi_accounts,
         signer,
@@ -140,50 +129,32 @@ pub mod liquid_staking {
     pub fn withdraw_sol(
         ctx: Context<WithdrawSol>,
         fluidSOL_amount: u64,
-        instant: bool,
     ) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
-        let authority = &ctx.accounts.authority;
-
-        require_keys_eq!(
-            pool.authority,
-            authority.key(),
-            ErrorCode::Unauthorized
-        );
         
+        // Validate withdrawal amount
         require!(fluidSOL_amount > 0, ErrorCode::InvalidAmount);
         
-        // Calculate SOL to return
+        // Calculate SOL to return based on current exchange rate
         let sol_to_return = fluidSOL_amount
             .checked_mul(pool.exchange_rate)
             .unwrap()
             .checked_div(1_000_000_000)
             .unwrap();
         
-        let mut withdrawal_fee = 0u64;
+        // Check if we have enough in liquid reserve for instant withdrawal
+        require!(sol_to_return <= pool.liquid_reserve, ErrorCode::InsufficientLiquidity);
         
-        if instant {
-            // Check if we have enough in liquid reserve
-            if sol_to_return > pool.liquid_reserve {
-                return Err(ErrorCode::InsufficientLiquidity.into());
-            }
-            
-            // Charge 0.3% instant withdrawal fee
-            withdrawal_fee = sol_to_return.checked_mul(30).unwrap().checked_div(10000).unwrap();
-            pool.protocol_fees_earned = pool.protocol_fees_earned.checked_add(withdrawal_fee).unwrap();
-        } else {
-            // For delayed withdrawals, initiate unstaking from validators
-            require!(sol_to_return <= pool.total_sol_deposited, ErrorCode::InsufficientFunds);
-        }
-        
+        // Calculate 0.3% instant withdrawal fee
+        let withdrawal_fee = sol_to_return.checked_mul(30).unwrap().checked_div(10000).unwrap();
         let net_sol_to_user = sol_to_return.checked_sub(withdrawal_fee).unwrap();
         
         msg!("Withdrawing {} fSOL for {} SOL (fee: {} SOL)", 
-             fluidSOL_amount as f64 / 1_000_000_000.0,
-             net_sol_to_user as f64 / 1_000_000_000.0,
-             withdrawal_fee as f64 / 1_000_000_000.0);
+            fluidSOL_amount as f64 / 1_000_000_000.0,
+            net_sol_to_user as f64 / 1_000_000_000.0,
+            withdrawal_fee as f64 / 1_000_000_000.0);
 
-        // Burn FluidSOL tokens
+        // Burn FluidSOL tokens from user's account
         let cpi_accounts = anchor_spl::token::Burn {
             mint: ctx.accounts.fluidSOL_mint.to_account_info(),
             from: ctx.accounts.user_fluidSOL_account.to_account_info(),
@@ -195,17 +166,18 @@ pub mod liquid_staking {
         );
         anchor_spl::token::burn(cpi_ctx, fluidSOL_amount)?;
 
-        // Transfer SOL to user
+        // Transfer SOL from pool to user (direct lamport manipulation - pool has data)
         **pool.to_account_info().try_borrow_mut_lamports()? -= net_sol_to_user;
         **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += net_sol_to_user;
 
-        // Update pool state
+        // Update pool accounting
         pool.total_sol_deposited = pool.total_sol_deposited.checked_sub(sol_to_return).unwrap();
         pool.total_fluidSOL_minted = pool.total_fluidSOL_minted.checked_sub(fluidSOL_amount).unwrap();
-        
-        if instant {
-            pool.liquid_reserve = pool.liquid_reserve.checked_sub(sol_to_return).unwrap();
-        }
+        pool.liquid_reserve = pool.liquid_reserve.checked_sub(sol_to_return).unwrap();
+        pool.protocol_fees_earned = pool.protocol_fees_earned.checked_add(withdrawal_fee).unwrap();
+
+        msg!("Withdrawal successful! Remaining pool reserve: {} SOL", 
+            pool.liquid_reserve as f64 / 1_000_000_000.0);
 
         Ok(())
     }
@@ -213,7 +185,7 @@ pub mod liquid_staking {
     pub fn stake_to_validator(
         ctx: Context<StakeToValidator>,
         amount: u64,
-        validator_index: u8,
+        slot: u64,
     ) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
 
@@ -224,12 +196,11 @@ pub mod liquid_staking {
         // Authority and validation checks
         require!(ctx.accounts.authority.key() == pool.authority, ErrorCode::Unauthorized);
         require!(amount <= pool.liquid_reserve, ErrorCode::InsufficientLiquidity);
-        require!(validator_index < pool.validator_count, ErrorCode::InvalidValidatorIndex);
+        // require!(validator_index < pool.validator_count, ErrorCode::InvalidValidatorIndex);
+        require!(slot > 0, ErrorCode::InvalidValidatorIndex);
         
         let validator_info = &mut ctx.accounts.validator_info;
         require!(validator_info.is_active, ErrorCode::ValidatorInactive);
-        
-        msg!("🚀 VALÓDI STAKING {} SOL to validator {}", amount as f64 / 1_000_000_000.0, validator_index);
 
         // Calculate rent-exempt minimum (stake account already has rent from init)
         let rent = Rent::get()?;
@@ -241,8 +212,8 @@ pub mod liquid_staking {
         msg!("🔍 Stake account (PDA): {}", ctx.accounts.stake_account.key());
 
         // Pool authority seeds for signing
-        let authority_key = pool.authority.key();
-        let pool_seeds = &[b"pool", authority_key.as_ref(), &[pool.bump]];
+        let pool_seeds = &[b"pool".as_ref(), &[pool.bump]];
+        
         let pool_signer = &[&pool_seeds[..]];
 
         // STEP 1: Initialize stake account (Anchor already created it as system account)
@@ -268,22 +239,62 @@ pub mod liquid_staking {
         // STEP 2: Transfer staking amount from pool to stake account
         msg!("🔍 STEP 2: Transferring {} lamports from pool to stake account...", amount);
 
-        // Manual lamport transfer since pool has data
-
+        // Direct lamport transfer - pool has data so can't use system program
         **pool.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.stake_account.to_account_info().try_borrow_mut_lamports()? += amount;
 
         msg!("✅ STEP 2 SUCCESS: Amount transferred to stake account!");
 
+        msg!("💎 BALANCES AFTER TRANSFER:");
+        msg!("  pool balance: {}", pool.to_account_info().lamports());
+        msg!("  stake_account balance: {}", ctx.accounts.stake_account.to_account_info().lamports());
+        msg!("  stake_account_rent_requirement: {}", stake_account_rent);
+
         // STEP 3: Delegate stake to validator
         msg!("🔍 STEP 3: Delegating stake to validator...");
         // TODO - Fix: Incorrect Program ID for instruction here somewhere.
         // msg! logs these accounts below.!
+        msg!("💎 Before DELEGATE IX 1 {}", &ctx.accounts.stake_account.key());
+        msg!("💎 Before DELEGATE IX 2 {}", &pool.key());
+        msg!("💎 Before DELEGATE IX 3 {}", &ctx.accounts.validator_vote_account.key());
         let delegate_ix = anchor_lang::solana_program::stake::instruction::delegate_stake(
             &ctx.accounts.stake_account.key(),
             &pool.key(), // Pool is the staker authority
             &ctx.accounts.validator_vote_account.key(),
         );
+
+        // Log instruction details
+        msg!("💎 DELEGATE IX CREATED:");
+        msg!("  program_id: {}", delegate_ix.program_id);
+        msg!("  accounts_len: {}", delegate_ix.accounts.len());
+
+        // Log accounts being passed to invoke_signed
+        msg!("💎 INVOKE_SIGNED ACCOUNTS:");
+        msg!("  [0] stake_account: {} (owner: {})", 
+            ctx.accounts.stake_account.key(), 
+            ctx.accounts.stake_account.owner);
+        msg!("  [1] vote_account: {}", ctx.accounts.validator_vote_account.key());
+        msg!("  [2] clock: {}", ctx.accounts.clock.key());
+        msg!("  [3] stake_history: {}", ctx.accounts.stake_history.key());
+        msg!("  [4] stake_config: {}", ctx.accounts.stake_config.key());
+        msg!("  [5] pool (authority): {}", pool.key());
+
+        // Log signer seeds
+        msg!("💎 SIGNER SEEDS:");
+        msg!("  pool_bump: {}", pool.bump);
+
+        msg!("🔍 TESTING PDA DERIVATION:");
+        let (derived_pool, derived_bump) = Pubkey::find_program_address(
+            &[b"pool"], 
+            &crate::ID
+        );
+        msg!("  derived_pool: {}", derived_pool);
+        msg!("  actual_pool: {}", pool.key());
+        msg!("  derived_bump: {}", derived_bump);
+        msg!("  stored_bump: {}", pool.bump);
+
+
+        // CPI - Cross-Program Invocation - signs "on behalf of someone, like PDA"
         anchor_lang::solana_program::program::invoke_signed(
             &delegate_ix,
             &[
@@ -293,7 +304,6 @@ pub mod liquid_staking {
                 ctx.accounts.stake_history.to_account_info(),
                 ctx.accounts.stake_config.to_account_info(),
                 pool.to_account_info(), // Pool signs as staker
-                ctx.accounts.stake_program.to_account_info(),
             ],
             pool_signer,
         )?;
@@ -471,8 +481,18 @@ pub mod liquid_staking {
         require!(amount <= pool.protocol_fees_earned, ErrorCode::InsufficientFunds);
         
         // Transfer fees to authority
-        **pool.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += amount;
+        let pool_seeds = &[b"pool".as_ref(), &[pool.bump]];
+        let pool_signer = &[&pool_seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: pool.to_account_info(),
+                to: ctx.accounts.authority.to_account_info(),
+            },
+            pool_signer, // Pool PDA signs the transfer
+        );
+        anchor_lang::system_program::transfer(cpi_context, amount)?;
         
         pool.protocol_fees_earned = pool.protocol_fees_earned.checked_sub(amount).unwrap();
         
@@ -495,7 +515,7 @@ pub struct InitializePool<'info> {
         init,
         payer = authority,
         space = 200,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -537,18 +557,18 @@ pub struct AddValidator<'info> {
 pub struct DepositSol<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-
-    /// CHECK: This is manually verified to match pool.authority in handler
-    pub authority: AccountInfo<'info>,
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
     
-    #[account(mut)]
+    #[account(
+    mut,
+    constraint = fluidSOL_mint.mint_authority == COption::Some(pool.key()) @ ErrorCode::InvalidMint
+    )]
     pub fluidSOL_mint: Account<'info, Mint>,
     
     #[account(mut)]
@@ -562,23 +582,24 @@ pub struct DepositSol<'info> {
 pub struct WithdrawSol<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
-
-    /// CHECK: This is manually verified to match pool.authority in handler
-    pub authority: AccountInfo<'info>,
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
     
-    #[account(mut)]
+    #[account(
+    mut,
+    constraint = fluidSOL_mint.mint_authority == COption::Some(pool.key()) @ ErrorCode::InvalidMint
+    )]
     pub fluidSOL_mint: Account<'info, Mint>,
     
     #[account(mut)]
     pub user_fluidSOL_account: Account<'info, TokenAccount>,
     
+    pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -588,7 +609,7 @@ pub struct StakeToValidators<'info> {
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -600,7 +621,7 @@ pub struct UpdateRewards<'info> {
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -612,7 +633,7 @@ pub struct RebalancePool<'info> {
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -625,20 +646,23 @@ pub struct WithdrawProtocolFees<'info> {
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
+#[instruction(amount: u64, slot: u64)]
 pub struct StakeToValidator<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -650,7 +674,7 @@ pub struct StakeToValidator<'info> {
     #[account(
         init,
         payer = authority,
-        seeds = [b"stake", pool.key().as_ref()],
+        seeds = [b"stake", authority.key().as_ref(), &slot.to_le_bytes()],
         bump,
         space = STAKE_ACCOUNT_SIZE,
         owner = anchor_lang::solana_program::stake::program::ID
@@ -683,7 +707,7 @@ pub struct HarvestRewards<'info> {
     
     #[account(
         mut,
-        seeds = [b"pool", authority.key().as_ref()],
+        seeds = [b"pool"],
         bump = pool.bump
     )]
     pub pool: Account<'info, StakingPool>,
@@ -739,7 +763,7 @@ pub enum ErrorCode {
     #[msg("Insufficient funds in pool")]
     InsufficientFunds,
     
-    #[msg("Insufficient liquidity for instant withdrawal")]
+    #[msg("Insufficient liquidity for operation")]
     InsufficientLiquidity,
     
     #[msg("Unauthorized: only pool authority can perform this action")]
